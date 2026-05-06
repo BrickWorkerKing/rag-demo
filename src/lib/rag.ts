@@ -3,6 +3,8 @@
 import { Document } from "@langchain/core/documents";
 import { Embeddings } from "@langchain/core/embeddings";
 import { ChatOpenAI } from "@langchain/openai";
+import { PromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Milvus, type MilvusLibArgs } from "@langchain/community/vectorstores/milvus";
 import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
@@ -34,6 +36,19 @@ env.localModelPath = LOCAL_MODEL_DIR;
 
 console.log(`[RAG] transformers local model dir: ${LOCAL_MODEL_DIR}`);
 console.log(`[RAG] transformers allowRemoteModels: ${env.allowRemoteModels}`);
+
+// 配置信息
+// const MILVUS_CONFIG = {
+//   collectionName: "rag_collection", // 向量数据库中的集合名称（类似于关系型数据库的表名）
+//   clientConfig: {
+//     address: process.env.MILVUS_ADDRESS || "localhost:19530", // Milvus 连接地址
+//   },
+// };
+
+const DEEPSEEK_CONFIG = {
+  apiKey: process.env.DEEPSEEK_API_KEY,
+  baseURL: "https://sg.uiuiapi.com/v1", // DeepSeek 或兼容 OpenAI 协议的 API 地址
+};
 
 /**
  * 向量库统一类型：
@@ -263,7 +278,90 @@ export class RAGEngine {
   /** Milvus 连接与集合配置 */
   private readonly milvusConfig: MilvusLibArgs;
 
+  /**
+   * 统一输出当前进程与向量库状态，便于排查“命中了哪个进程、当前走了哪条分支”。
+   */
+  private logDebug(label: string, extra: Record<string, unknown> = {}): void {
+    console.log(`[RAG Debug] ${label}`, {
+      pid: process.pid,
+      node: process.version,
+      isMemoryStore: this.isMemoryStore,
+      hasVectorStore: Boolean(this.vectorStore),
+      milvusUrl: this.milvusConfig.url ?? null,
+      collectionName: this.milvusConfig.collectionName ?? null,
+      ...extra,
+    });
+  }
+
+  /**
+   * Milvus Lite 冷启动时存在一个“进程已拉起但 gRPC 尚未 ready”的短窗口。
+   * 这里做一个轻量级健康检查重试，避免模块刚初始化就误判连接失败。
+   */
+  private async waitForMilvusHealthy(
+    context: string,
+    maxAttempts: number = 5,
+    retryDelayMs: number = 400
+  ): Promise<void> {
+    const { MilvusClient } = await import("@zilliz/milvus2-sdk-node");
+    let lastError: unknown = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let client: InstanceType<typeof MilvusClient> | null = null;
+      try {
+        client = new MilvusClient({ address: this.milvusConfig.url! });
+        const health = await client.checkHealth();
+        this.logDebug("milvus.healthCheck", {
+          context,
+          attempt,
+          isHealthy: health.isHealthy,
+          reasons: health.reasons,
+        });
+
+        if (health.isHealthy) {
+          return;
+        }
+
+        lastError = new Error("Milvus is not healthy");
+      } catch (error) {
+        lastError = error;
+        this.logDebug("milvus.healthCheck.failed", {
+          context,
+          attempt,
+          error,
+        });
+      } finally {
+        if (client) {
+          try {
+            await client.closeConnection();
+          } catch (closeError) {
+            this.logDebug("milvus.healthCheck.closeFailed", {
+              context,
+              attempt,
+              error: closeError,
+            });
+          }
+        }
+      }
+
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`[RAG] Milvus health check failed in ${context}.`);
+  }
+
   constructor() {
+    console.log("[RAG Constructor] 正在初始化 RAG 引擎...");
+    if (!DEEPSEEK_CONFIG.apiKey) {
+        throw new Error("环境变量中未设置 DEEPSEEK_API_KEY。");
+    }
+    if (DEEPSEEK_CONFIG.apiKey === 'mock-key') {
+        console.warn("[RAG Warning] 使用 Mock API Key，LLM 功能将受限或返回模拟数据。");
+    }
+
     // 初始化本地 embedding（中文 bge small）。
     this.embeddings = new LocalHuggingFaceEmbeddings({
       model: "Xenova/bge-small-zh-v1.5",
@@ -272,28 +370,37 @@ export class RAGEngine {
 
     // 初始化 ChatOpenAI，使用你指定的模型与 baseURL。
     this.llm = new ChatOpenAI({
-      model: "doubao-seed-1-6-flash-250828",
-      apiKey: process.env.DEEPSEEK_API_KEY,
+      model: "deepseek-v3",
+      apiKey: DEEPSEEK_CONFIG.apiKey, // 兼容旧命名
       configuration: {
-        baseURL: "https://sg.uiuiapi.com/v1",
+        baseURL: DEEPSEEK_CONFIG.baseURL,
       },
+      temperature: 0.7, // 随机性控制：0.7 比较平衡，既有创造性又不会太发散
     });
 
     // Milvus 默认连接本机 19530，可通过环境变量覆盖。
+    const milvusUrl = process.env.MILVUS_URL ?? "127.0.0.1:19530";
+    // 确保 url 不带 http:// 前缀，否则 gRPC 会报错 undefined undefined (retried 3 times)
+    const cleanMilvusUrl = milvusUrl.replace(/^https?:\/\//, '');
+
     this.milvusConfig = {
       collectionName: process.env.MILVUS_COLLECTION_NAME ?? "rag_demo",
-      url: process.env.MILVUS_URL ?? "http://127.0.0.1:19530",
+      url: cleanMilvusUrl,
       primaryField: "id",
       vectorField: "vector",
       textField: "text",
+      textFieldMaxLength: 65535, // 显式声明文本字段的最大长度，防止基于第一个短文档动态推断出太短的长度（如172）导致后续追加长文档失败
       autoId: true,
+      clientConfig: {
+        address: cleanMilvusUrl,
+      },
     };
 
-    if (!process.env.DEEPSEEK_API_KEY) {
-      console.warn(
-        "[RAG] DEEPSEEK_API_KEY is not set. Chat model calls will fail until it is configured."
-      );
-    }
+    // 启动时记录运行时信息，方便确认请求命中的实际进程与 Milvus 连接参数。
+    this.logDebug("constructor.ready", {
+      rawMilvusUrl: milvusUrl,
+      cleanMilvusUrl,
+    });
   }
 
   /**
@@ -301,18 +408,36 @@ export class RAGEngine {
    *
    * 策略：
    * 1. 先尝试连接已有 Milvus 集合（fromExistingCollection）。
-   * 2. 如果失败，自动降级到 MemoryVectorStore。
-   *
-   * 注意：
-   * - 降级后 isMemoryStore=true，后续入库将走内存分支。
+   * 2. 如果失败，仅记录日志，保持 vectorStore 为 null，交由后续按需创建（如 addDocument 时）。
    */
   async init(): Promise<void> {
     if (this.initPromise) {
+      this.logDebug("init.reusePromise");
       return this.initPromise;
     }
 
     this.initPromise = (async () => {
+      this.logDebug("init.start");
       try {
+        await this.waitForMilvusHealthy("init");
+        
+        // 1. 动态导入 MilvusClient 并检查集合是否存在
+        const { MilvusClient } = await import("@zilliz/milvus2-sdk-node");
+        const client = new MilvusClient({ address: this.milvusConfig.url! });
+        
+        const hasCollectionRes = await client.hasCollection({ 
+          collection_name: this.milvusConfig.collectionName! 
+        });
+        
+        await client.closeConnection();
+
+        if (!hasCollectionRes.value) {
+          console.log(`[RAG] Milvus collection '${this.milvusConfig.collectionName}' does not exist yet. It will be created on first document addition.`);
+          this.logDebug("init.collectionNotFound");
+          return;
+        }
+
+        // 2. 集合存在，进行连接
         console.log("[RAG] Trying to connect to existing Milvus collection...");
         this.vectorStore = await Milvus.fromExistingCollection(
           this.embeddings,
@@ -320,17 +445,44 @@ export class RAGEngine {
         );
         this.isMemoryStore = false;
         console.log("[RAG] Milvus connected.");
+        this.logDebug("init.connected");
       } catch (error) {
         console.warn(
-          "[RAG] Milvus connection failed. Fallback to in-memory vector store.",
+          "[RAG] Milvus connection failed during init.",
           error
         );
-        this.isMemoryStore = true;
-        this.vectorStore = new MemoryVectorStore(this.embeddings);
+        this.logDebug("init.connectFailed", {
+          error,
+        });
       }
     })();
 
     return this.initPromise;
+  }
+
+  /**
+   * 统一的降级处理逻辑：切换到内存向量库
+   * @param chunks 需要初始化写入的文档块（如果有）
+   */
+  private async fallbackToMemoryStore(chunks: Document[] = []): Promise<void> {
+    this.logDebug("fallback.memoryStore.start", {
+      chunkCount: chunks.length,
+    });
+    this.isMemoryStore = true;
+    if (chunks.length > 0) {
+      this.vectorStore = await MemoryVectorStore.fromDocuments(
+        chunks,
+        this.embeddings
+      );
+      console.log(`[RAG] MemoryVectorStore created and seeded with ${chunks.length} chunks.`);
+      this.logDebug("fallback.memoryStore.seeded", {
+        chunkCount: chunks.length,
+      });
+    } else {
+      this.vectorStore = new MemoryVectorStore(this.embeddings);
+      console.log("[RAG] Empty MemoryVectorStore created.");
+      this.logDebug("fallback.memoryStore.empty");
+    }
   }
 
   /**
@@ -384,75 +536,60 @@ export class RAGEngine {
   }
 
   /**
-   * 文档入库主流程（ETL）。
-   *
-   * 完整步骤：
-   * 1. init：确保向量库可用（Milvus 或内存降级）。
-   * 2. load：按文件类型加载为 Document[]。
-   * 3. split：使用 RecursiveCharacterTextSplitter 切块。
-   * 4. embed/store：
-   *    - 未创建向量库时：优先创建 Milvus，失败降级 Memory。
-   *    - 已有向量库时：直接 addDocuments 追加。
+   * 将原始文档进行元数据补全和切块处理
    */
-  async addDocument(fileName: string, fileBuffer: Buffer): Promise<void> {
-    await this.init();
-
-    const rawDocs = await this.loadDocuments(fileName, fileBuffer);
-    if (rawDocs.length === 0) {
-      console.warn("[RAG] No documents parsed, skip indexing.");
-      return;
-    }
-
+  private async processDocuments(rawDocs: Document[], fileName: string): Promise<Document[]> {
     // chunkSize 按你的要求设置为 800；保留一定 overlap 提升召回连续性。
     const splitter = new RecursiveCharacterTextSplitter({
       chunkSize: 800,
       chunkOverlap: 100,
+      separators: ["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""],
     });
 
     // 给每个文档补充统一 source，方便后续检索结果溯源。
-    const docs = rawDocs.map((doc) => {
-      return new Document({
-        pageContent: doc.pageContent,
-        metadata: {
-          ...doc.metadata,
-          source: fileName,
-        },
-      });
+    const docs = rawDocs.map((doc) => new Document({
+      pageContent: doc.pageContent,
+      metadata: { ...doc.metadata, source: fileName },
+    }));
+
+    return splitter.splitDocuments(docs);
+  }
+
+  /**
+   * 将切块后的文档存入向量库
+   */
+  private async storeDocuments(chunks: Document[]): Promise<void> {
+    this.logDebug("storeDocuments.start", {
+      chunkCount: chunks.length,
     });
-
-    const chunks = await splitter.splitDocuments(docs);
-    console.log(
-      `[RAG] Parsed ${rawDocs.length} docs from ${fileName}, split into ${chunks.length} chunks.`
-    );
-
     // 首次入库：如果还没有 vectorStore，则先创建。
     if (!this.vectorStore) {
-      // 优先走 Milvus 创建分支。
       if (!this.isMemoryStore) {
         try {
           console.log("[RAG] Creating Milvus collection via fromDocuments...");
+          this.logDebug("storeDocuments.createMilvus.attempt", {
+            chunkCount: chunks.length,
+          });
           this.vectorStore = await Milvus.fromDocuments(
             chunks,
             this.embeddings,
             this.milvusConfig
           );
           console.log("[RAG] Milvus collection created and seeded.");
+          this.logDebug("storeDocuments.createMilvus.success", {
+            chunkCount: chunks.length,
+          });
           return;
         } catch (error) {
-          console.warn(
-            "[RAG] Milvus create failed. Falling back to MemoryVectorStore.",
-            error
-          );
-          this.isMemoryStore = true;
+          console.error("[RAG] Milvus create failed. Error details:", error);
+          this.logDebug("storeDocuments.createMilvus.failed", {
+            chunkCount: chunks.length,
+            error,
+          });
+          console.warn("[RAG] Falling back to MemoryVectorStore.");
         }
       }
-
-      // Milvus 不可用时，降级为内存向量库并完成首批数据写入。
-      this.vectorStore = await MemoryVectorStore.fromDocuments(
-        chunks,
-        this.embeddings
-      );
-      console.log("[RAG] MemoryVectorStore created and seeded.");
+      await this.fallbackToMemoryStore(chunks);
       return;
     }
 
@@ -460,25 +597,463 @@ export class RAGEngine {
     try {
       await this.vectorStore.addDocuments(chunks);
       console.log(`[RAG] Added ${chunks.length} chunks into vector store.`);
+      this.logDebug("storeDocuments.addDocuments.success", {
+        chunkCount: chunks.length,
+      });
     } catch (error) {
-      // 如果当前是 Milvus 且追加失败，自动切到内存模式，保证流程不中断。
       if (!this.isMemoryStore) {
         console.warn(
           "[RAG] Milvus addDocuments failed. Switching to MemoryVectorStore.",
           error
         );
-        this.vectorStore = await MemoryVectorStore.fromDocuments(
-          chunks,
-          this.embeddings
-        );
-        this.isMemoryStore = true;
+        this.logDebug("storeDocuments.addDocuments.failed", {
+          chunkCount: chunks.length,
+          error,
+        });
+        await this.fallbackToMemoryStore(chunks);
         return;
       }
-
-      // 已经是内存模式仍失败，向上抛错让调用方处理。
       throw error;
     }
   }
+
+  /**
+   * 文档入库主流程（ETL）。
+   *
+   * 完整步骤：
+   * 1. init：确保向量库可用（Milvus 或内存降级）。
+   * 2. load：按文件类型加载为 Document[]。
+   * 3. process：切块并补充元数据。
+   * 4. store：存入向量库。
+   * @returns 成功入库的 chunk 数量
+   */
+  async addDocument(fileName: string, fileBuffer: Buffer): Promise<number> {
+    this.logDebug("addDocument.start", {
+      fileName,
+      fileSize: fileBuffer.length,
+    });
+    await this.init();
+
+    // 1、文档加载：根据文件类型加载为 Document[]
+    const rawDocs = await this.loadDocuments(fileName, fileBuffer);
+    if (rawDocs.length === 0) {
+      console.warn("[RAG] No documents parsed, skip indexing.");
+      return 0;
+    }
+
+    // 2、文档处理：切块并补充元数据
+    const chunks = await this.processDocuments(rawDocs, fileName);
+    console.log(
+      `[RAG] Parsed ${rawDocs.length} docs from ${fileName}, split into ${chunks.length} chunks.`
+    );
+
+    // 3、元数据清洗 (Metadata Cleaning) - 对于 MemoryStore 可能不是必须的，但保留好习惯
+     chunks.forEach((doc, index) => {
+        // 确保 metadata 存在
+        doc.metadata = doc.metadata || {};
+        
+        // 1. 移除已知可能导致问题的字段
+        if ('blobType' in doc.metadata) {
+            delete doc.metadata.blobType;
+        }
+        if ('loc' in doc.metadata) {
+            delete doc.metadata.loc;
+        }
+        if ('pdf' in doc.metadata) {
+            delete doc.metadata.pdf;
+        }
+        if ('line' in doc.metadata) {
+            delete doc.metadata.line;
+        }
+
+        // 2. 扁平化处理：将所有元数据值转换为 JSON 字符串
+        for (const key in doc.metadata) {
+            // 确保没有 undefined/null 值
+            if (doc.metadata[key] === undefined || doc.metadata[key] === null) {
+                 delete doc.metadata[key];
+                 continue;
+            }
+
+            const value = doc.metadata[key];
+            if (typeof value === 'object' && value !== null) {
+                doc.metadata[key] = JSON.stringify(value);
+            }
+        }
+    });
+
+    // 4、文档存储：存入向量库
+    await this.storeDocuments(chunks);
+    return chunks.length;
+  }
+
+  /**
+   * 清空向量库中的所有数据。
+   */
+  async reset(): Promise<void> {
+    // 1. 内存模式检查
+    if (this.isMemoryStore) {
+      this.vectorStore = null;
+      console.log("[RAG] 内存向量库已重置。");
+      return;
+    }
+
+    // 2. Milvus 模式
+    let client: any = null;
+    try {
+      // 动态导入 @zilliz/milvus2-sdk-node 中的 MilvusClient
+      const { MilvusClient } = await import("@zilliz/milvus2-sdk-node");
+      
+      // 创建 client 实例，直接使用整理好的 clean URL
+      client = new MilvusClient({ address: this.milvusConfig.url! });
+
+      const collectionName = this.milvusConfig.collectionName;
+      if (collectionName) {
+        // 删除整个集合
+        await client.dropCollection({
+          collection_name: collectionName,
+        });
+        console.log(`[RAG] Milvus collection '${collectionName}' has been dropped.`);
+      }
+
+      // 成功后将 this.vectorStore 置为 null
+      this.vectorStore = null;
+      this.initPromise = null;
+    } catch (error) {
+      // 异常处理：捕获并打印错误
+      console.error("[RAG] Failed to reset Milvus collection:", error);
+      throw new Error("Failed to reset knowledge base.");
+    } finally {
+      // 资源清理：无论成功失败，都在 finally 块中调用 client.closeConnection()
+      if (client) {
+        await client.closeConnection();
+      }
+    }
+  }
+
+  /**
+   * 获取文档片段列表（支持简单的分页）。
+   * 主要用于前端管理界面展示。
+   *
+   * @param page 页码，默认 1
+   * @param pageSize 每页条数，默认 10
+   */
+  async getDocuments(page: number = 1, pageSize: number = 10): Promise<{ total: number, documents: Document[] }> {
+    // 1. 内存模式
+    if (this.isMemoryStore) {
+      if (!this.vectorStore) {
+        return { total: 0, documents: [] };
+      }
+      const store = this.vectorStore as MemoryVectorStore;
+      const vectors = store.memoryVectors || [];
+      const total = vectors.length;
+      const offset = (page - 1) * pageSize;
+      const paginated = vectors.slice(offset, offset + pageSize);
+      
+      const docs = paginated.map(v => new Document({
+        pageContent: v.content,
+        metadata: v.metadata,
+      }));
+      
+      return { total, documents: docs };
+    }
+
+    // 2. Milvus 模式
+    let client: any = null;
+    try {
+      // 动态导入 MilvusClient 并建立连接
+      const { MilvusClient } = await import("@zilliz/milvus2-sdk-node");
+      client = new MilvusClient({ address: this.milvusConfig.url! });
+
+      // 健康检查
+      const health = await client.checkHealth();
+      if (!health.isHealthy) {
+        throw new Error("Milvus is not healthy");
+      }
+
+      const collectionName = this.milvusConfig.collectionName!;
+      
+      // 集合检查
+      const hasCollectionRes = await client.hasCollection({ collection_name: collectionName });
+      if (!hasCollectionRes.value) {
+        return { total: 0, documents: [] };
+      }
+
+      // 加载集合：查询前必须的操作
+      await client.loadCollectionSync({ collection_name: collectionName });
+
+      // 获取总数
+      const statsRes = await client.getCollectionStatistics({ collection_name: collectionName });
+      const rowCountItem = statsRes.stats.find((item: any) => item.key === "row_count");
+      const total = rowCountItem ? parseInt(rowCountItem.value, 10) : 0;
+
+      // 计算 offset
+      const offset = (page - 1) * pageSize;
+      const textField = this.milvusConfig.textField || "text";
+
+      // 准备查询参数
+      let queryParams = {
+        collection_name: collectionName,
+        filter: "langchain_primaryid >= 0", // 默认使用 langchain_primaryid
+        output_fields: ["*"], // 返回所有标量字段
+        limit: pageSize,
+        offset: offset,
+      };
+
+      // 执行分页查询
+      let res = await client.query(queryParams);
+
+      // 主键兼容性处理
+      if (res.status.error_code !== "Success") {
+        console.warn(`[RAG] Query with 'langchain_primaryid' failed (${res.status.reason}), checking schema for actual primary key...`);
+        
+        // 调用 describeCollection 获取 Schema
+        const describeRes = await client.describeCollection({ collection_name: collectionName });
+        
+        // 找到 is_primary_key: true 的字段名
+        const pkFieldObj = describeRes.schema.fields.find((field: any) => field.is_primary_key === true);
+        
+        if (pkFieldObj && pkFieldObj.name !== "langchain_primaryid") {
+          const actualPkField = pkFieldObj.name;
+          console.log(`[RAG] Found actual primary key: '${actualPkField}', retrying query...`);
+          
+          // 使用新的主键名重试查询
+          queryParams.filter = `${actualPkField} >= 0`;
+          res = await client.query(queryParams);
+        }
+      }
+
+      // 处理返回结果
+      const docs = (res.data || []).map((item: any) => new Document({
+        pageContent: item[textField],
+        metadata: {
+          source: item.source,
+          ext: item.ext,
+          // 保留所有其他字段，除了主键、向量和文本本身
+          ...Object.keys(item).reduce((acc: any, key) => {
+            if (key !== textField && key !== "vector" && !key.includes("id")) {
+              acc[key] = item[key];
+            }
+            return acc;
+          }, {})
+        }
+      }));
+
+      return { total, documents: docs };
+    } catch (error) {
+      console.error("[RAG] Failed to fetch documents from Milvus:", error);
+      // 根据要求，这里可以返回空列表或者抛出异常。
+      // 为保持健壮性，捕获健康检查等异常后返回空列表。
+      return { total: 0, documents: [] };
+    } finally {
+      // 资源清理：finally 中关闭连接
+      if (client) {
+        await client.closeConnection();
+      }
+    }
+  }
+  /**
+   * 核心对话方法：完整的 检索-重排序-生成 (Retrieval-Rerank-Generation) 流程
+   *
+   * @param query 用户提问
+   * @returns 包含生成的回复内容和引用的数据来源
+   */
+  async chat(query: string, history: {role: string, content: string}[] = []): Promise<{ answer: string; sources: Document[] }> {
+    // 1. Mock 模式前置拦截
+    // Mock Mode check - moved to top to bypass DB check
+    if (DEEPSEEK_CONFIG.apiKey === 'mock-key') {
+        console.log("[Chat] Mock Mode: 跳过检索、Rerank 和生成，返回模拟数据。");
+        const mockDocs = [
+            new Document({ pageContent: "Mock Doc 1", metadata: { source: "mock", score: 0.9, relevanceScore: 9.9 } }),
+            new Document({ pageContent: "Mock Doc 2", metadata: { source: "mock", score: 0.8, relevanceScore: 8.8 } })
+        ];
+        return {
+            answer: "这是模拟的回答：确实有降噪耳机（Mock Mode）。",
+            sources: mockDocs
+        };
+    }
+
+    // --- 阶段零：多轮对话查询重写 (Query Rewrite) ---
+    let searchTargetQuery = query;
+    let historyText = "";
+
+    // 过滤掉刚刚发进来的最新一条（当前 query），只取前面的真正的历史
+    const validHistory = history.filter((msg, idx) => {
+        return !(idx === history.length - 1 && msg.role === 'user' && msg.content === query);
+    });
+
+    if (validHistory.length > 0) {
+      console.log(`[RAG] Phase 0: Rewriting query based on ${validHistory.length} history turns...`);
+      historyText = validHistory.map(m => `${m.role === 'user' ? '用户' : '客服'}: ${m.content}`).join('\n');
+      
+      const rewritePromptTemplate = PromptTemplate.fromTemplate(`
+给定以下对话历史和一个后续问题，请将后续问题重写为一个独立的、信息完整的问题，使其可以在没有对话历史的情况下被理解。
+如果后续问题已经很清晰，不需要上下文，请直接返回原问题。
+不要回答问题，只返回重写后的句子，不要有任何多余的解释。
+
+对话历史：
+{history}
+
+后续问题：{query}
+
+重写后的独立问题：
+`);
+      try {
+        const rewriteChain = rewritePromptTemplate.pipe(this.llm).pipe(new StringOutputParser());
+        searchTargetQuery = await rewriteChain.invoke({ history: historyText, query: query });
+        console.log(`[RAG] Query rewritten: "${query}" -> "${searchTargetQuery}"`);
+      } catch (error) {
+        console.warn("[RAG] Query rewrite failed, falling back to original query.", error);
+      }
+    }
+
+    // 2. 知识库状态检查与重连
+    if (!this.vectorStore) {
+      if (this.isMemoryStore) {
+        throw new Error("知识库为空。请先上传文件构建知识库。");
+      }
+      
+      // 尝试重连 Milvus
+      try {
+        console.log("[RAG] Vector store not initialized, attempting to reconnect...");
+        this.vectorStore = await Milvus.fromExistingCollection(
+          this.embeddings,
+          this.milvusConfig
+        );
+        this.isMemoryStore = false;
+      } catch (error) {
+        console.error("[RAG] Failed to connect to Milvus in chat method:", error);
+        throw new Error("知识库连接失败。请确保已上传文件且 Milvus 服务正常运行。");
+      }
+    }
+
+    // 3. 阶段一：初步检索 (Retrieval)
+    console.log(`[RAG] Phase 1: Retrieving top 10 documents for query: "${searchTargetQuery}"`);
+    const searchResults = await this.vectorStore.similaritySearchWithScore(searchTargetQuery, 10);
+    const candidateDocs = searchResults.map(([doc]) => doc);
+
+    if (candidateDocs.length === 0) {
+      return {
+        answer: "抱歉，在知识库中没有找到相关信息来回答您的问题。",
+        sources: []
+      };
+    }
+
+    // 4. 阶段二：LLM 重排序 (Rerank)
+    console.log(`[RAG] Phase 2: Reranking ${candidateDocs.length} candidates using LLM...`);
+    
+    // 构造候选文档文本
+    const candidatesText = candidateDocs.map((doc, idx) => `[文档ID: ${idx}]\n内容: ${doc.pageContent}`).join("\n\n");
+    
+    // 构造 Rerank Prompt
+    const rerankPromptTemplate = PromptTemplate.fromTemplate(`
+你是一个文档相关性评分专家。请根据用户的提问，评估以下候选文档与提问的相关性。
+相关性评分范围为 0 到 10 分。0 分表示完全不相关，10 分表示非常相关且能直接回答提问。
+
+用户提问: {query}
+
+候选文档:
+{candidates}
+
+请务必返回一个纯 JSON 数组，包含每个文档的 ID 和评分，不要包含任何其他文字解释或 Markdown 代码块包裹。
+输出格式要求必须严格如下：
+[
+  {{"id": 0, "score": 9.5}},
+  {{"id": 1, "score": 2.1}}
+]
+`);
+    
+    let finalDocs: Document[] = [];
+    
+    try {
+      const rerankPrompt = await rerankPromptTemplate.format({
+        query: searchTargetQuery,
+        candidates: candidatesText
+      });
+      
+      const rerankResponse = await this.llm.invoke(rerankPrompt);
+      const responseText = rerankResponse.content.toString();
+      
+      // 清理可能包含的 Markdown JSON 代码块
+      const jsonStr = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      
+      const scores = JSON.parse(jsonStr) as { id: number, score: number }[];
+      console.log(`[RAG] Rerank scores parsed:`, scores);
+      
+      // 将评分回填并过滤
+      for (const item of scores) {
+        if (item.id >= 0 && item.id < candidateDocs.length) {
+          const doc = candidateDocs[item.id];
+          doc.metadata = { ...doc.metadata, relevanceScore: item.score };
+          
+          // 只保留评分 >= 6 的文档
+          if (item.score >= 6) {
+            finalDocs.push(doc);
+          }
+        }
+      }
+      
+      // 按分数降序排列，取 Top 3
+      finalDocs.sort((a, b) => ((b.metadata.relevanceScore as number) || 0) - ((a.metadata.relevanceScore as number) || 0));
+      finalDocs = finalDocs.slice(0, 3);
+      
+    } catch (error) {
+      console.warn("[RAG] Rerank process failed or JSON parse error. Falling back to top 3 initial search results.", error);
+      // 降级策略：使用原始检索结果的前 3 个，并标记 relevanceScore 为 0
+      finalDocs = candidateDocs.slice(0, 3).map(doc => {
+        doc.metadata = { ...doc.metadata, relevanceScore: 0 };
+        return doc;
+      });
+    }
+
+    // 兜底：如果 Rerank 后结果为空，强制使用原始 Top 1，避免无话可说
+    if (finalDocs.length === 0 && candidateDocs.length > 0) {
+      console.log("[RAG] No docs passed rerank threshold. Using top 1 as fallback.");
+      const fallbackDoc = candidateDocs[0];
+      fallbackDoc.metadata = { ...fallbackDoc.metadata, relevanceScore: -1 };
+      finalDocs = [fallbackDoc];
+    }
+
+    // 5. 阶段三：最终生成 (Generation)
+    console.log(`[RAG] Phase 3: Generating answer using ${finalDocs.length} top documents...`);
+    
+    // 上下文组装
+    const contextText = finalDocs.map(doc => doc.pageContent).join("\n\n---\n\n");
+    
+    const generatePromptTemplate = PromptTemplate.fromTemplate(`
+你是"睿智商城"的智能客服。请基于以下提供的已知信息，友好、专业地回答用户的问题。
+要求：
+1. 只能基于提供的已知信息回答，不要编造任何内容。
+2. 如果已知信息无法回答用户的问题，请直接告知用户你不知道或建议联系人工客服。
+3. 语气要亲切、专业。
+
+已知信息:
+{context}
+
+历史对话:
+{history}
+
+用户当前提问: {question}
+
+回答:
+`);
+
+    const chain = generatePromptTemplate.pipe(this.llm).pipe(new StringOutputParser());
+    
+    const answer = await chain.invoke({
+      context: contextText,
+      history: historyText || "无",
+      question: query
+    });
+
+    console.log("[RAG] Generation complete.");
+
+    // 6. 返回结果
+    return {
+      answer,
+      sources: finalDocs
+    };
+  }
+
 }
 
 /**
@@ -489,20 +1064,31 @@ export class RAGEngine {
  * - 避免每次热重载重复初始化模型/连接。
  */
 declare global {
-  var __ragEngineSingleton: RAGEngine | undefined;
+  var __ragEnginePromise: Promise<RAGEngine> | undefined;
 }
 
 /**
  * 获取 RAGEngine 单例。
  *
- * 首次调用创建实例，后续直接复用。
+ * 首次调用时创建实例并完成异步初始化，后续直接复用同一个 Promise。
  */
-export function getRAGEngine(): RAGEngine {
-  if (!globalThis.__ragEngineSingleton) {
-    globalThis.__ragEngineSingleton = new RAGEngine();
+export async function getRAGEngine(): Promise<RAGEngine> {
+  if (!globalThis.__ragEnginePromise) {
+    console.log("[RAG Singleton] creating new promise", {
+      pid: process.pid,
+      node: process.version,
+    });
+    globalThis.__ragEnginePromise = (async () => {
+      const engine = new RAGEngine();
+      // 单例首次创建时立即完成初始化，避免调用方拿到未初始化实例。
+      await engine.init();
+      return engine;
+    })();
+  } else {
+    console.log("[RAG Singleton] reusing existing promise", {
+      pid: process.pid,
+      node: process.version,
+    });
   }
-  return globalThis.__ragEngineSingleton;
+  return globalThis.__ragEnginePromise;
 }
-
-/** 便捷导出：可直接 import { ragEngine } 使用 */
-export const ragEngine = getRAGEngine();
